@@ -1,0 +1,12 @@
+credentials:
+  usernames:
+    david:
+      email: david.nh.kim@gmail.com
+      name: David Kim
+      # 기본 비밀번호: btcanalyzer2024  (반드시 변경하세요!)
+      password: "$2b$12$ZhzNBe60iS/YHfnANBUmieHmWFqgu10uaIwVjjCEyS0kJUSHbDv7y"
+cookie:
+  expiry_days: 30
+  # 쿠키 서명 키 — Streamlit Cloud에서는 COOKIE_KEY secret으로 오버라이드됨
+  key: "change-this-key-in-production"
+  name: btc_analyzer_auth

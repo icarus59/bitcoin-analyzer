@@ -18,6 +18,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+import yaml
+from yaml.loader import SafeLoader
+import streamlit_authenticator as stauth
 
 load_dotenv()
 
@@ -92,6 +95,48 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════
+# 인증 (로그인)
+# ══════════════════════════════════════════════
+
+def _load_auth_config() -> dict:
+    """
+    config.yaml에서 인증 설정 로드.
+    Streamlit Cloud 배포 시 COOKIE_KEY secret으로 쿠키 서명 키를 오버라이드.
+    """
+    cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = yaml.load(f, Loader=SafeLoader)
+    except FileNotFoundError:
+        st.error(
+            "❌ **config.yaml 파일을 찾을 수 없습니다.**\n\n"
+            "`python setup_users.py` 를 실행해서 첫 사용자를 등록해주세요."
+        )
+        st.stop()
+    # Streamlit Cloud secrets에서 쿠키 서명 키 오버라이드
+    try:
+        if "COOKIE_KEY" in st.secrets and st.secrets["COOKIE_KEY"]:
+            cfg["cookie"]["key"] = st.secrets["COOKIE_KEY"]
+    except Exception:
+        pass
+    return cfg
+
+
+def _setup_authenticator() -> stauth.Authenticate:
+    """Authenticate 인스턴스 생성 (session_state에 캐시)"""
+    if "_authenticator" not in st.session_state:
+        cfg = _load_auth_config()
+        st.session_state["_authenticator"] = stauth.Authenticate(
+            credentials=cfg["credentials"],
+            cookie_name=cfg["cookie"]["name"],
+            cookie_key=cfg["cookie"]["key"],
+            cookie_expiry_days=cfg["cookie"]["expiry_days"],
+            auto_hash=False,   # config.yaml에 이미 bcrypt 해시 저장됨
+        )
+    return st.session_state["_authenticator"]
 
 
 # ══════════════════════════════════════════════
@@ -1009,6 +1054,49 @@ def krw(v: float) -> str:
 # ══════════════════════════════════════════════
 
 def main():
+    # ══════════════════════════════════════════
+    # 로그인 인증
+    # ══════════════════════════════════════════
+    authenticator = _setup_authenticator()
+
+    # 로그인 폼 렌더링 (쿠키가 유효하면 자동 로그인, 아니면 폼 표시)
+    authenticator.login(
+        location="main",
+        max_login_attempts=5,
+        fields={
+            "Form name": "₿ BTC 투자 분석기",
+            "Username":  "아이디",
+            "Password":  "비밀번호",
+            "Login":     "로그인",
+        },
+        key="login_widget",
+    )
+
+    auth_status = st.session_state.get("authentication_status")
+
+    if auth_status is False:
+        st.error("❌ 아이디 또는 비밀번호가 올바르지 않습니다.")
+        st.stop()
+
+    if auth_status is None:
+        # 로그인 폼만 보이고 나머지는 렌더링하지 않음
+        st.stop()
+
+    # ── 로그아웃 (사이드바) ───────────────────
+    with st.sidebar:
+        st.markdown(f"👤 **{st.session_state.get('name', '')}**")
+        st.caption(f"@{st.session_state.get('username', '')}")
+        st.markdown("---")
+        authenticator.logout(
+            button_name="🚪 로그아웃",
+            location="sidebar",
+            key="logout_btn",
+        )
+
+    # ══════════════════════════════════════════
+    # 대시보드 메인
+    # ══════════════════════════════════════════
+
     # ── 헤더 ──────────────────────────────────
     hdr_l, hdr_r = st.columns([7, 3])
     with hdr_l:
