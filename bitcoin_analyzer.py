@@ -588,112 +588,222 @@ def get_bithumb_ohlcv_monthly() -> pd.DataFrame | None:
 
 @st.cache_data(ttl=300)
 def get_binance_futures_history() -> dict:
-    """바이낸스 선물 히스토리 데이터 (기관·고래 추이 분석용, 5분 캐시)"""
-    base = "https://fapi.binance.com"
-    out: dict = {}
+    """선물 히스토리 데이터 (기관·고래 추이 분석용, 5분 캐시)
+    Binance → 차단 시 Bybit 자동 폴백"""
 
-    def _df(url: str, params: dict) -> pd.DataFrame:
-        return pd.DataFrame(requests.get(url, params=params, timeout=8).json())
+    # ── Binance 시도 ───────────────────────────────────────────────────────────
+    def _binance_history() -> dict:
+        base = "https://fapi.binance.com"
+        out: dict = {}
 
-    # ① OI 30일 일봉
-    try:
-        d = _df(f"{base}/futures/data/openInterestHist",
-                {"symbol": "BTCUSDT", "period": "1d", "limit": 30})
-        d["ts"] = pd.to_datetime(d["timestamp"].astype(np.int64), unit="ms")
-        d["oi"] = d["sumOpenInterest"].astype(float)
-        out["oi"] = d[["ts", "oi"]].reset_index(drop=True)
-    except Exception:
-        out["oi"] = None
+        def _df(url: str, params: dict) -> pd.DataFrame:
+            return pd.DataFrame(requests.get(url, params=params, timeout=8).json())
 
-    # ② Top Trader L/S 비율 72시간 (1h 캔들)
-    try:
-        d = _df(f"{base}/futures/data/topLongShortAccountRatio",
-                {"symbol": "BTCUSDT", "period": "1h", "limit": 72})
-        d["ts"]        = pd.to_datetime(d["timestamp"].astype(np.int64), unit="ms")
-        d["ls_ratio"]  = d["longShortRatio"].astype(float)
-        d["long_pct"]  = d["longAccount"].astype(float)
-        d["short_pct"] = d["shortAccount"].astype(float)
-        out["ls"] = d[["ts", "ls_ratio", "long_pct", "short_pct"]].reset_index(drop=True)
-    except Exception:
-        out["ls"] = None
+        # ① OI 30일 일봉
+        try:
+            d = _df(f"{base}/futures/data/openInterestHist",
+                    {"symbol": "BTCUSDT", "period": "1d", "limit": 30})
+            d["ts"] = pd.to_datetime(d["timestamp"].astype(np.int64), unit="ms")
+            d["oi"] = d["sumOpenInterest"].astype(float)
+            out["oi"] = d[["ts", "oi"]].reset_index(drop=True)
+        except Exception:
+            out["oi"] = None
 
-    # ③ 테이커 매수/매도 비율 72시간 (1h 캔들)
-    try:
-        d = _df(f"{base}/futures/data/takerlongshortRatio",
-                {"symbol": "BTCUSDT", "period": "1h", "limit": 72})
-        d["ts"]    = pd.to_datetime(d["timestamp"].astype(np.int64), unit="ms")
-        d["ratio"] = d["buySellRatio"].astype(float)
-        d["buy_v"] = d["buyVol"].astype(float)
-        d["sel_v"] = d["sellVol"].astype(float)
-        out["taker"] = d[["ts", "ratio", "buy_v", "sel_v"]].reset_index(drop=True)
-    except Exception:
+        # ② Top Trader L/S 비율 72시간 (1h)
+        try:
+            d = _df(f"{base}/futures/data/topLongShortAccountRatio",
+                    {"symbol": "BTCUSDT", "period": "1h", "limit": 72})
+            d["ts"]        = pd.to_datetime(d["timestamp"].astype(np.int64), unit="ms")
+            d["ls_ratio"]  = d["longShortRatio"].astype(float)
+            d["long_pct"]  = d["longAccount"].astype(float)
+            d["short_pct"] = d["shortAccount"].astype(float)
+            out["ls"] = d[["ts", "ls_ratio", "long_pct", "short_pct"]].reset_index(drop=True)
+        except Exception:
+            out["ls"] = None
+
+        # ③ 테이커 매수/매도 비율 72시간 (1h)
+        try:
+            d = _df(f"{base}/futures/data/takerlongshortRatio",
+                    {"symbol": "BTCUSDT", "period": "1h", "limit": 72})
+            d["ts"]    = pd.to_datetime(d["timestamp"].astype(np.int64), unit="ms")
+            d["ratio"] = d["buySellRatio"].astype(float)
+            d["buy_v"] = d["buyVol"].astype(float)
+            d["sel_v"] = d["sellVol"].astype(float)
+            out["taker"] = d[["ts", "ratio", "buy_v", "sel_v"]].reset_index(drop=True)
+        except Exception:
+            out["taker"] = None
+
+        # ④ 펀딩 레이트 최근 30회
+        try:
+            d = _df(f"{base}/fapi/v1/fundingRate",
+                    {"symbol": "BTCUSDT", "limit": 30})
+            d["ts"]   = pd.to_datetime(d["fundingTime"].astype(np.int64), unit="ms")
+            d["rate"] = d["fundingRate"].astype(float) * 100
+            out["funding"] = d[["ts", "rate"]].reset_index(drop=True)
+        except Exception:
+            out["funding"] = None
+
+        # Binance가 차단되면 모든 항목이 None → 폴백 트리거
+        if all(v is None for v in out.values()):
+            raise RuntimeError("Binance blocked")
+        return out
+
+    # ── Bybit 폴백 ────────────────────────────────────────────────────────────
+    def _bybit_history() -> dict:
+        base = "https://api.bybit.com/v5"
+        out: dict = {}
+
+        # ① OI 30일 일봉
+        try:
+            r = requests.get(f"{base}/market/open-interest",
+                params={"category": "linear", "symbol": "BTCUSDT",
+                        "intervalTime": "1d", "limit": 30}, timeout=8)
+            items = r.json()["result"]["list"]
+            df = pd.DataFrame(items)
+            df["ts"] = pd.to_datetime(df["timestamp"].astype(np.int64), unit="ms")
+            df["oi"] = df["openInterest"].astype(float)
+            out["oi"] = df[["ts", "oi"]].sort_values("ts").reset_index(drop=True)
+        except Exception:
+            out["oi"] = None
+
+        # ② L/S 비율 72시간 (1h) — Bybit account-ratio
+        try:
+            r = requests.get(f"{base}/market/account-ratio",
+                params={"category": "linear", "symbol": "BTCUSDT",
+                        "period": "1h", "limit": 72}, timeout=8)
+            items = r.json()["result"]["list"]
+            df = pd.DataFrame(items)
+            df["ts"]       = pd.to_datetime(df["timestamp"].astype(np.int64), unit="ms")
+            df["long_pct"] = df["buyRatio"].astype(float)
+            df["short_pct"]= df["sellRatio"].astype(float)
+            df["ls_ratio"] = df["long_pct"] / df["short_pct"].replace(0, 1)
+            out["ls"] = df[["ts", "ls_ratio", "long_pct", "short_pct"]].sort_values("ts").reset_index(drop=True)
+        except Exception:
+            out["ls"] = None
+
+        # ③ 테이커 비율 — Bybit 공개 API 미지원, None 유지
         out["taker"] = None
 
-    # ④ 펀딩 레이트 최근 30회 (8시간마다 → 약 10일)
-    try:
-        d = _df(f"{base}/fapi/v1/fundingRate",
-                {"symbol": "BTCUSDT", "limit": 30})
-        d["ts"]   = pd.to_datetime(d["fundingTime"].astype(np.int64), unit="ms")
-        d["rate"] = d["fundingRate"].astype(float) * 100   # % 단위
-        out["funding"] = d[["ts", "rate"]].reset_index(drop=True)
-    except Exception:
-        out["funding"] = None
+        # ④ 펀딩 레이트 히스토리
+        try:
+            r = requests.get(f"{base}/market/funding/history",
+                params={"category": "linear", "symbol": "BTCUSDT", "limit": 30},
+                timeout=8)
+            items = r.json()["result"]["list"]
+            df = pd.DataFrame(items)
+            df["ts"]   = pd.to_datetime(df["fundingRateTimestamp"].astype(np.int64), unit="ms")
+            df["rate"] = df["fundingRate"].astype(float) * 100
+            out["funding"] = df[["ts", "rate"]].sort_values("ts").reset_index(drop=True)
+        except Exception:
+            out["funding"] = None
 
-    return out
+        return out
+
+    # ── 실행 순서: Binance → Bybit ───────────────────────────────────────────
+    try:
+        return _binance_history()
+    except Exception:
+        return _bybit_history()
 
 
 @st.cache_data(ttl=300)
 def get_binance_futures() -> dict | None:
-    """바이낸스 선물 공개 API — 기관·고래 동향 자동 수집 (API 키 불필요)"""
-    try:
+    """선물 공개 API — 기관·고래 동향 자동 수집 (API 키 불필요)
+    Binance → 차단 시 Bybit 자동 폴백"""
+
+    # ── Binance 시도 ───────────────────────────────────────────────────────────
+    def _from_binance() -> dict:
         base = "https://fapi.binance.com"
 
-        # ① Top Trader 롱/숏 비율 (기관 포지션 방향 대리 지표)
         r_ls = requests.get(
             f"{base}/futures/data/topLongShortAccountRatio",
-            params={"symbol": "BTCUSDT", "period": "1h", "limit": 2},
-            timeout=6,
+            params={"symbol": "BTCUSDT", "period": "1h", "limit": 2}, timeout=6,
         )
-        ls_data = r_ls.json()
+        ls_data  = r_ls.json()
         ls_ratio = float(ls_data[-1]["longShortRatio"]) if ls_data else 1.0
 
-        # ② 펀딩 레이트 (롱/숏 비용 — 과열 역발상 지표)
         r_fr = requests.get(
             f"{base}/fapi/v1/premiumIndex",
-            params={"symbol": "BTCUSDT"},
-            timeout=6,
+            params={"symbol": "BTCUSDT"}, timeout=6,
         )
         funding_rate = float(r_fr.json().get("lastFundingRate", 0))
 
-        # ③ 테이커 매수/매도 비율 (공격적 주문 방향 — 고래 동향)
         r_tk = requests.get(
             f"{base}/futures/data/takerlongshortRatio",
-            params={"symbol": "BTCUSDT", "period": "1h", "limit": 2},
-            timeout=6,
+            params={"symbol": "BTCUSDT", "period": "1h", "limit": 2}, timeout=6,
         )
-        tk_data = r_tk.json()
+        tk_data     = r_tk.json()
         taker_ratio = float(tk_data[-1]["buySellRatio"]) if tk_data else 1.0
 
-        # ④ OI 24h 변화율 (기관 포지션 증감)
         r_oi = requests.get(
             f"{base}/futures/data/openInterestHist",
-            params={"symbol": "BTCUSDT", "period": "1h", "limit": 25},
-            timeout=6,
+            params={"symbol": "BTCUSDT", "period": "1h", "limit": 25}, timeout=6,
         )
-        oi_data = r_oi.json()
-        oi_now  = float(oi_data[-1]["sumOpenInterest"]) if oi_data else 0
-        oi_prev = float(oi_data[0]["sumOpenInterest"])  if oi_data else 0
+        oi_data       = r_oi.json()
+        oi_now        = float(oi_data[-1]["sumOpenInterest"]) if oi_data else 0
+        oi_prev       = float(oi_data[0]["sumOpenInterest"])  if oi_data else 0
+        oi_change_pct = (oi_now - oi_prev) / oi_prev * 100   if oi_prev else 0
+
+        return {
+            "ls_ratio":      ls_ratio,
+            "funding_rate":  funding_rate,
+            "taker_ratio":   taker_ratio,
+            "oi_change_pct": oi_change_pct,
+            "oi_now":        oi_now,
+            "source":        "Binance",
+        }
+
+    # ── Bybit 폴백 ────────────────────────────────────────────────────────────
+    def _from_bybit() -> dict:
+        base = "https://api.bybit.com/v5"
+
+        # 티커 (펀딩 레이트 포함)
+        r_tick = requests.get(
+            f"{base}/market/tickers",
+            params={"category": "linear", "symbol": "BTCUSDT"}, timeout=6,
+        )
+        tick         = r_tick.json()["result"]["list"][0]
+        funding_rate = float(tick.get("fundingRate", 0))
+
+        # L/S 비율
+        r_ls   = requests.get(
+            f"{base}/market/account-ratio",
+            params={"category": "linear", "symbol": "BTCUSDT",
+                    "period": "1h", "limit": 2}, timeout=6,
+        )
+        ls_items  = r_ls.json()["result"]["list"]
+        buy_ratio = float(ls_items[0]["buyRatio"])
+        sel_ratio = float(ls_items[0]["sellRatio"])
+        ls_ratio  = buy_ratio / sel_ratio if sel_ratio > 0 else 1.0
+
+        # OI 변화율 (25시간)
+        r_oi = requests.get(
+            f"{base}/market/open-interest",
+            params={"category": "linear", "symbol": "BTCUSDT",
+                    "intervalTime": "1h", "limit": 25}, timeout=6,
+        )
+        oi_items      = r_oi.json()["result"]["list"]   # 최신이 [0]
+        oi_now        = float(oi_items[0]["openInterest"])
+        oi_prev       = float(oi_items[-1]["openInterest"])
         oi_change_pct = (oi_now - oi_prev) / oi_prev * 100 if oi_prev else 0
 
         return {
-            "ls_ratio":       ls_ratio,       # 롱/숏 비율 (Top Trader)
-            "funding_rate":   funding_rate,   # 펀딩 레이트
-            "taker_ratio":    taker_ratio,    # 테이커 매수/매도 비율
-            "oi_change_pct":  oi_change_pct,  # OI 24h 변화율(%)
-            "oi_now":         oi_now,
+            "ls_ratio":      ls_ratio,
+            "funding_rate":  funding_rate,
+            "taker_ratio":   1.0,          # Bybit 공개 API 미지원 → 중립
+            "oi_change_pct": oi_change_pct,
+            "oi_now":        oi_now,
+            "source":        "Bybit",
         }
+
+    # ── 실행 순서: Binance → Bybit ───────────────────────────────────────────
+    try:
+        return _from_binance()
     except Exception:
-        return None   # 캐시 함수 내부에서 st.warning 금지 — 호출부에서 처리
+        try:
+            return _from_bybit()
+        except Exception:
+            return None
 
 
 def signal_ls_ratio(ratio: float) -> float:
@@ -1803,9 +1913,10 @@ def main():
                 )
 
         # ── 기관·고래 동향 (자동) ─────────────
-        with st.expander("🐋 기관·고래 동향 (바이낸스 선물 자동 수집)", expanded=True):
+        src_label = futures.get("source", "Binance") if futures else "?"
+        with st.expander(f"🐋 기관·고래 동향 (선물 자동 수집 · {src_label})", expanded=True):
             if futures is None:
-                st.info("📡 바이낸스 선물 API 미연결 (클라우드 IP 차단) — 가중치는 유지되나 신호값이 0으로 처리됩니다.", icon="ℹ️")
+                st.warning("📡 선물 API(Binance·Bybit) 모두 응답 없음 — 가중치는 유지되나 신호값이 0으로 처리됩니다.", icon="⚠️")
 
             wh1, wh2 = st.columns(2)
 
@@ -2053,8 +2164,9 @@ def main():
     # 기관·고래 동향 상세 분석
     # ══════════════════════════════════════════
     st.markdown("---")
+    _src = futures.get("source", "Binance") if futures else "Bybit"
     st.subheader("🐋 기관·고래 동향 상세 분석")
-    st.caption("Binance Futures 공개 API · 5분 캐시 · API 키 불필요")
+    st.caption(f"데이터 출처: {_src} Futures 공개 API · 5분 캐시 · API 키 불필요")
 
     with st.spinner("선물 히스토리 불러오는 중…"):
         fhist = get_binance_futures_history()
@@ -2274,12 +2386,11 @@ def main():
                 st.plotly_chart(fig_fr, use_container_width=True, key="wh_fr")
 
     else:
-        st.info(
-            "📡 **바이낸스 선물 API를 불러올 수 없습니다.**\n\n"
-            "Binance는 일부 클라우드 서버 IP를 차단합니다. "
-            "**Streamlit Cloud 배포 환경에서는 이 섹션이 비활성화**될 수 있습니다. "
-            "로컬에서 실행하면 정상적으로 표시됩니다.",
-            icon="ℹ️",
+        st.warning(
+            "📡 **선물 히스토리 데이터를 불러올 수 없습니다.**\n\n"
+            "Binance와 Bybit API 모두 응답하지 않았습니다. "
+            "잠시 후 페이지를 새로고침 해주세요.",
+            icon="⚠️",
         )
 
     # ══════════════════════════════════════════
@@ -2370,12 +2481,17 @@ def main():
     elif ai_sum.get("error"):
         err_msg = ai_sum['error']
         if "OPENAI_API_KEY" in err_msg or "Missing credentials" in err_msg or "api_key" in err_msg.lower():
-            st.info(
-                "💡 **AI 요약을 사용하려면 OpenAI API 키가 필요합니다.**\n\n"
-                "- **로컬 실행 시:** 프로젝트 폴더의 `.env` 파일에 `OPENAI_API_KEY=sk-...` 추가\n"
-                "- **Streamlit Cloud 배포 시:** 앱 설정 → Secrets 에 `OPENAI_API_KEY = \"sk-...\"` 추가",
-                icon="🔑",
-            )
+            with st.expander("🔑 AI 자동 요약을 활성화하려면 클릭", expanded=False):
+                st.markdown(
+                    "**OpenAI API 키**가 설정되지 않아 AI 요약 기능이 비활성화되어 있습니다.\n\n"
+                    "**Streamlit Cloud 배포 시:**\n"
+                    "앱 대시보드 → ⋮ → **Settings → Secrets** 에 아래 내용 추가:\n"
+                    "```toml\n"
+                    'OPENAI_API_KEY = "sk-..."\n'
+                    "```\n\n"
+                    "**로컬 실행 시:**\n"
+                    "프로젝트 폴더의 `.env` 파일에 `OPENAI_API_KEY=sk-...` 추가"
+                )
         else:
             st.warning(f"AI 요약 오류: {err_msg}")
 
