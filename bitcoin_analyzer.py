@@ -586,6 +586,40 @@ def get_bithumb_ohlcv_monthly() -> pd.DataFrame | None:
     return None
 
 
+@st.cache_data(ttl=3600)
+def get_global_volume() -> pd.DataFrame | None:
+    """CoinGecko BTC 글로벌 거래량 90일 (전세계 거래소 합산 USD) — API 키 불필요, 1시간 캐시
+    days=90 → 시간봉 데이터를 일별로 리샘플링
+    """
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
+            params={"vs_currency": "usd", "days": "90"},
+            timeout=12,
+            headers={"Accept": "application/json"},
+        )
+        r.raise_for_status()
+        vols = r.json().get("total_volumes", [])
+        if not vols:
+            return None
+
+        df = pd.DataFrame(vols, columns=["ts_ms", "volume"])
+        df["date"] = pd.to_datetime(df["ts_ms"], unit="ms").dt.normalize()
+
+        # 시간봉 → 일봉 (하루 마지막 값)
+        df = df.groupby("date")["volume"].last().reset_index()
+        df = df.sort_values("date").reset_index(drop=True)
+
+        df["vol_prev"]    = df["volume"].shift(1)
+        df["vol_chg_pct"] = (df["volume"] - df["vol_prev"]) / df["vol_prev"] * 100
+        df["vol_ma30"]    = df["volume"].rolling(30, min_periods=7).mean()
+        df["vol_vs_avg"]  = df["volume"] / df["vol_ma30"]
+
+        return df
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=300)
 def get_binance_futures_history() -> dict:
     """선물 히스토리 데이터 (기관·고래 추이 분석용, 5분 캐시)
@@ -1210,7 +1244,7 @@ def main():
     # ── 헤더 ──────────────────────────────────
     hdr_l, hdr_r = st.columns([7, 3])
     with hdr_l:
-        st.title("₿ 비트코인 투자 분석 대시보드")
+        st.title("BTC 투자 분석 대시보드")
         st.caption("빗썸(Bithumb) 실시간 연동 · 다중 지표 가중치 기반 예측")
     with hdr_r:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -1369,7 +1403,7 @@ def main():
     _sel = st.radio(
         "차트기간",
         _period_labels,
-        index=2,           # 기본값: 3개월
+        index=4,           # 기본값: 1년
         horizontal=True,
         label_visibility="collapsed",
         key="chart_period",
@@ -2252,6 +2286,80 @@ def main():
             )
             return fig
 
+        # ── 현재 수치 기반 해석 텍스트 생성 ─────────────────────────────────────
+        _ls   = futures["ls_ratio"]
+        _oi   = futures["oi_change_pct"]
+        _tk   = futures["taker_ratio"]
+        _fr   = fr_pct
+
+        # 롱/숏 비율 해석
+        if _ls >= 1.5:
+            _ls_interp = (f"🔴 **현재 {_ls:.3f}** — 롱이 숏보다 **{(_ls-1)*100:.0f}% 많습니다.**\n"
+                          f"1.5 이상의 롱 과열 구간으로, 기관들이 과도하게 상승에 베팅한 상태입니다. "
+                          f"대규모 청산이 발생하면 급락 압력이 커질 수 있습니다. → **하락 경고**")
+        elif _ls >= 1.1:
+            _ls_interp = (f"🟡 **현재 {_ls:.3f}** — 롱이 숏보다 **{(_ls-1)*100:.0f}% 많습니다.**\n"
+                          f"중립에서 롱 우세 구간. 아직 과열은 아니지만 롱 쏠림이 진행 중입니다. → **약한 하락 경고**")
+        elif _ls <= 0.8:
+            _ls_interp = (f"🟢 **현재 {_ls:.3f}** — 숏이 롱보다 **{(1/_ls-1)*100:.0f}% 많습니다.**\n"
+                          f"0.8 이하의 숏 과열 구간으로, 숏 스퀴즈(강제 청산)가 발생하면 "
+                          f"급등 가능성이 있습니다. → **상승 신호**")
+        elif _ls <= 0.9:
+            _ls_interp = (f"🟡 **현재 {_ls:.3f}** — 숏이 소폭 우세합니다.\n"
+                          f"중립에서 숏 우세 구간. 과열은 아니며 방향성 주시가 필요합니다. → **약한 상승 신호**")
+        else:
+            _ls_interp = (f"⚪ **현재 {_ls:.3f}** — 롱과 숏이 거의 균형 상태입니다.\n"
+                          f"1.0 근처의 중립 구간으로 기관들의 방향성 베팅이 뚜렷하지 않습니다. → **중립**")
+
+        # OI 변화율 해석
+        if _oi >= 2:
+            _oi_interp = (f"🟢 **현재 +{_oi:.2f}%** — 24시간 동안 포지션이 **{_oi:.2f}% 증가**했습니다.\n"
+                          f"신규 자금이 대거 유입되어 포지션이 확대 중입니다. "
+                          f"현재 추세(상승 또는 하락)가 강화될 가능성이 높습니다. → **추세 강화**")
+        elif _oi >= 0:
+            _oi_interp = (f"🟡 **현재 +{_oi:.2f}%** — 포지션이 소폭 증가했습니다.\n"
+                          f"큰 변화는 없으나 소규모 자금 유입이 있습니다. → **중립~약한 추세 강화**")
+        elif _oi >= -2:
+            _oi_interp = (f"🟡 **현재 {_oi:.2f}%** — 포지션이 소폭 감소했습니다.\n"
+                          f"일부 포지션이 청산되고 있지만 큰 흐름은 아닙니다. → **중립~약한 청산 흐름**")
+        else:
+            _oi_interp = (f"🔴 **현재 {_oi:.2f}%** — 24시간 동안 포지션이 **{abs(_oi):.2f}% 감소**했습니다.\n"
+                          f"대규모 청산이 진행 중입니다. 추세 약화 또는 반전 가능성이 있습니다. → **청산 주의**")
+
+        # 펀딩 레이트 해석
+        if _fr >= 0.03:
+            _fr_interp = (f"🔴 **현재 +{_fr:.4f}%** — 롱 포지션이 8시간마다 숏에게 **{_fr:.4f}%씩 수수료를 냅니다.**\n"
+                          f"+0.03% 이상의 롱 극단 과열 구간입니다. 롱 비용이 너무 높아 "
+                          f"포지션 축소 압력이 생깁니다. → **강한 하락 경고**")
+        elif _fr >= 0.01:
+            _fr_interp = (f"🟡 **현재 +{_fr:.4f}%** — 롱이 숏에게 수수료를 내는 중입니다.\n"
+                          f"롱 우세 구간이지만 아직 과열은 아닙니다. 추이를 지켜봐야 합니다. → **약한 하락 경고**")
+        elif _fr <= -0.03:
+            _fr_interp = (f"🟢 **현재 {_fr:.4f}%** — 숏 포지션이 8시간마다 롱에게 **{abs(_fr):.4f}%씩 수수료를 냅니다.**\n"
+                          f"-0.03% 이하의 숏 극단 과열 구간입니다. 숏 비용 부담으로 "
+                          f"커버링(숏 청산) 반등 가능성이 있습니다. → **강한 상승 신호**")
+        elif _fr <= -0.01:
+            _fr_interp = (f"🟡 **현재 {_fr:.4f}%** — 숏이 롱에게 수수료를 내는 중입니다.\n"
+                          f"숏 우세 구간이지만 과열은 아닙니다. → **약한 상승 신호**")
+        else:
+            _fr_interp = (f"⚪ **현재 {_fr:.4f}%** — 롱·숏 간 비용이 거의 없는 균형 상태입니다.\n"
+                          f"시장이 한쪽으로 쏠리지 않은 중립 구간입니다. → **중립**")
+
+        # 테이커 비율 해석
+        if _tk >= 1.2:
+            _tk_interp = (f"🟢 **현재 {_tk:.3f}** — 즉시 매수 주문이 즉시 매도 주문보다 **{(_tk-1)*100:.0f}% 많습니다.**\n"
+                          f"공격적으로 사려는 세력이 강합니다. 단기 상승 압력이 높은 상태입니다. → **상승 압력**")
+        elif _tk >= 1.0:
+            _tk_interp = (f"🟡 **현재 {_tk:.3f}** — 즉시 매수가 소폭 우세합니다.\n"
+                          f"매수세가 약간 강하지만 뚜렷한 방향성은 없습니다. → **약한 상승 압력**")
+        elif _tk <= 0.85:
+            _tk_interp = (f"🔴 **현재 {_tk:.3f}** — 즉시 매도 주문이 즉시 매수 주문보다 **{(1/_tk-1)*100:.0f}% 많습니다.**\n"
+                          f"공격적으로 팔려는 세력이 강합니다. 단기 하락 압력이 높은 상태입니다. → **하락 압력**")
+        else:
+            _tk_interp = (f"🟡 **현재 {_tk:.3f}** — 즉시 매도가 소폭 우세합니다.\n"
+                          f"매도세가 약간 강하지만 뚜렷한 방향성은 없습니다. → **약한 하락 압력**")
+
+        # ── 게이지 차트 4개 ───────────────────────────────────────────────────
         g1, g2, g3, g4 = st.columns(4)
         with g1:
             st.plotly_chart(
@@ -2260,6 +2368,15 @@ def main():
                 use_container_width=True, key="wh_g1",
             )
             st.caption("🔴 1.5↑ 롱 과열(매도신호)　🟢 0.8↓ 숏 과열(매수신호)")
+            with st.expander("📖 현재 수치 해석 + 지표 설명"):
+                st.markdown(_ls_interp)
+                st.markdown("---")
+                st.markdown(
+                    "**지표 설명:** 바이낸스 상위 트레이더(기관·고래)의 롱/숏 계좌 비율입니다.\n\n"
+                    "비율 = 롱 계좌 수 ÷ 숏 계좌 수. **역발상 지표**로 읽습니다.\n"
+                    "너무 많은 기관이 한 방향으로 쏠리면, 반대 방향으로 급격히 청산될 위험이 커집니다.\n\n"
+                    "> 💡 스마트머니는 대중이 한쪽으로 몰릴 때 반대 방향을 준비합니다."
+                )
         with g2:
             st.plotly_chart(
                 _mini_gauge("OI 24h 변화율", futures["oi_change_pct"],
@@ -2267,6 +2384,19 @@ def main():
                 use_container_width=True, key="wh_g2",
             )
             st.caption("🟢 양수 포지션 확대　🔴 음수 청산 흐름")
+            with st.expander("📖 현재 수치 해석 + 지표 설명"):
+                st.markdown(_oi_interp)
+                st.markdown("---")
+                st.markdown(
+                    "**지표 설명:** OI(미결제약정)는 현재 시장에 열려 있는 선물 포지션의 총량입니다.\n\n"
+                    "| 가격 | OI | 의미 |\n"
+                    "|------|-----|------|\n"
+                    "| ↑ 상승 | ↑ 증가 | 🟢 신규 롱 진입 → 강한 상승 |\n"
+                    "| ↑ 상승 | ↓ 감소 | ⚠️ 숏 청산(숏 스퀴즈) → 상승 약할 수 있음 |\n"
+                    "| ↓ 하락 | ↑ 증가 | 🔴 신규 숏 진입 → 강한 하락 |\n"
+                    "| ↓ 하락 | ↓ 감소 | ⚠️ 롱 청산 → 하락 마무리 가능성 |\n\n"
+                    "> 💡 OI가 늘수록 큰 손들이 포지션을 키우는 것 — 다음 움직임이 강해집니다."
+                )
         with g3:
             st.plotly_chart(
                 _mini_gauge("펀딩 레이트", fr_pct,
@@ -2274,6 +2404,16 @@ def main():
                 use_container_width=True, key="wh_g3",
             )
             st.caption("🔴 +0.03%↑ 롱 과열　🟢 음수 숏 과열")
+            with st.expander("📖 현재 수치 해석 + 지표 설명"):
+                st.markdown(_fr_interp)
+                st.markdown("---")
+                st.markdown(
+                    "**지표 설명:** 선물 시장에서 8시간마다 롱↔숏이 주고받는 수수료입니다.\n\n"
+                    "- **양수(+)**: 롱이 숏에게 수수료 냄 → 롱 과열 → **역발상으로 하락 경고**\n"
+                    "- **음수(-)**: 숏이 롱에게 수수료 냄 → 숏 과열 → **역발상으로 상승 신호**\n"
+                    "- 과열 기준: `±0.03%` / 극단 과열: `±0.05% 이상`\n\n"
+                    "> 💡 2021년 5월 급락 직전 펀딩 레이트는 `+0.1%`를 넘었습니다."
+                )
         with g4:
             st.plotly_chart(
                 _mini_gauge("테이커 매수/매도 비율",
@@ -2281,6 +2421,17 @@ def main():
                 use_container_width=True, key="wh_g4",
             )
             st.caption("🟢 1.2↑ 공격적 매수　🔴 0.85↓ 공격적 매도")
+            with st.expander("📖 현재 수치 해석 + 지표 설명"):
+                st.markdown(_tk_interp)
+                st.markdown("---")
+                st.markdown(
+                    "**지표 설명:** 시장가(즉시 체결) 주문 중 매수/매도 비율입니다.\n\n"
+                    "- **메이커**: 지정가 주문 (천천히 기다림)\n"
+                    "- **테이커**: 시장가 주문 (지금 즉시 체결) ← 급한 세력의 주문\n\n"
+                    "- 🟢 `1.2 이상` → 즉시 매수 압도 → 강한 상승 압력\n"
+                    "- 🔴 `0.85 이하` → 즉시 매도 압도 → 강한 하락 압력\n\n"
+                    "> 💡 가격 급등/급락 직전에 테이커 비율이 먼저 크게 움직이는 경향이 있습니다."
+                )
 
         # ── 추이 차트 4종 ────────────────────
         st.markdown("##### 📈 히스토리 추이")
@@ -2305,6 +2456,7 @@ def main():
                     showlegend=False, yaxis=dict(tickformat=".3s"),
                 )
                 st.plotly_chart(fig_oi, use_container_width=True, key="wh_oi")
+                st.caption("🟢 막대 상승 = 신규 포지션 유입　🔴 막대 하락 = 포지션 청산　|　막대가 클수록 시장 참여자가 많음")
 
         # L/S 롱·숏 비중 72h 영역 차트
         with hc2:
@@ -2333,6 +2485,7 @@ def main():
                     yaxis=dict(range=[0, 100], ticksuffix="%"),
                 )
                 st.plotly_chart(fig_ls, use_container_width=True, key="wh_ls")
+                st.caption("🟢 초록선이 50% 위로 올라갈수록 기관이 상승 베팅 중　🔴 빨간선이 50% 위 = 기관이 하락 베팅 중")
 
         hc3, hc4 = st.columns(2)
 
@@ -2357,6 +2510,7 @@ def main():
                     showlegend=False,
                 )
                 st.plotly_chart(fig_tk, use_container_width=True, key="wh_tk")
+                st.caption("🟢 1.0 위 = 즉시 매수 우세(상승 압력)　🔴 1.0 아래 = 즉시 매도 우세(하락 압력)　|　기준선 1.0에서 멀수록 강한 신호")
 
         # 펀딩 레이트 히스토리 바 차트
         with hc4:
@@ -2384,12 +2538,167 @@ def main():
                     yaxis=dict(ticksuffix="%"),
                 )
                 st.plotly_chart(fig_fr, use_container_width=True, key="wh_fr")
+                st.caption("🔴 양수 막대 = 롱이 많아 수수료 냄(롱 과열)　🟢 음수 막대 = 숏이 많아 수수료 냄(숏 과열)　|　점선 넘으면 극단 과열")
 
     else:
         st.warning(
             "📡 **선물 히스토리 데이터를 불러올 수 없습니다.**\n\n"
             "Binance와 Bybit API 모두 응답하지 않았습니다. "
             "잠시 후 페이지를 새로고침 해주세요.",
+            icon="⚠️",
+        )
+
+    # ══════════════════════════════════════════
+    # 글로벌 BTC 거래량 분석 (CoinGecko)
+    # ══════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("🌍 글로벌 BTC 거래량 분석")
+    st.caption("CoinGecko 공개 API · 전세계 거래소 합산 USD · 1시간 캐시 · API 키 불필요")
+
+    with st.spinner("CoinGecko 거래량 데이터 불러오는 중…"):
+        vol_df = get_global_volume()
+
+    if vol_df is not None and len(vol_df) >= 2:
+        last_v   = vol_df.iloc[-1]
+        today_vol = last_v["volume"]
+        avg30_v   = last_v["vol_ma30"]
+        chg_pct_v = last_v["vol_chg_pct"]
+        vs_avg_v  = last_v["vol_vs_avg"]
+
+        # ── 급등·급감 알림 배너 ──────────────────────────────────────────────
+        if pd.notna(vs_avg_v):
+            avg30_str = f"${avg30_v/1e9:.1f}B" if pd.notna(avg30_v) else "—"
+            if vs_avg_v >= 2.0:
+                st.error(
+                    f"🚨 **거래량 급등!** 오늘 거래량이 30일 평균의 **{vs_avg_v:.1f}배**입니다. "
+                    f"(${today_vol/1e9:.1f}B vs 평균 {avg30_str}) — "
+                    "대형 이벤트 또는 높은 변동성 구간. 포지션 관리 주의 요망.",
+                )
+            elif vs_avg_v >= 1.5:
+                st.warning(
+                    f"⚠️ **거래량 증가** 오늘 거래량이 30일 평균의 **{vs_avg_v:.1f}배**입니다. "
+                    f"(${today_vol/1e9:.1f}B vs 평균 {avg30_str}) — "
+                    "시장 관심 증가 중. 추세 강화 또는 변동성 확대 가능.",
+                )
+            elif vs_avg_v <= 0.5:
+                st.info(
+                    f"⬇️ **거래량 저조** 오늘 거래량이 30일 평균의 **{vs_avg_v:.1f}배**입니다. "
+                    f"(${today_vol/1e9:.1f}B vs 평균 {avg30_str}) — "
+                    "관망세 또는 방향성 탐색 중. 돌파 시 거래량 확인 필요.",
+                )
+
+        # ── KPI 카드 ────────────────────────────────────────────────────────
+        gv1, gv2, gv3, gv4 = st.columns(4)
+
+        _cv = "#26a65b" if (pd.notna(chg_pct_v) and chg_pct_v >= 0) else "#e03131"
+        _ct = f"{'📈' if pd.notna(chg_pct_v) and chg_pct_v >= 0 else '📉'} {chg_pct_v:+.1f}%" if pd.notna(chg_pct_v) else "—"
+        gv1.markdown(_kpi("🌍 오늘 거래량", f"${today_vol/1e9:.1f}B",
+                           delta=_ct, delta_color=_cv), unsafe_allow_html=True)
+        gv2.markdown(_kpi("📅 30일 평균",
+                           f"${avg30_v/1e9:.1f}B" if pd.notna(avg30_v) else "계산 중"),
+                     unsafe_allow_html=True)
+        if pd.notna(vs_avg_v):
+            _vc = ("#e03131" if vs_avg_v >= 2.0 else
+                   "#b07d00" if vs_avg_v >= 1.5 else
+                   "#26a65b" if vs_avg_v <= 0.7 else "#555555")
+            _vl = ("🚨 급등" if vs_avg_v >= 2.0 else
+                   "⚠️ 증가" if vs_avg_v >= 1.5 else
+                   "⬇️ 저조" if vs_avg_v <= 0.7 else "✅ 정상")
+            gv3.markdown(_kpi("📊 평균 대비", f"{vs_avg_v:.2f}×",
+                               delta=_vl, delta_color=_vc), unsafe_allow_html=True)
+        max7v = vol_df.tail(7)["volume"].max()
+        gv4.markdown(_kpi("📈 7일 최고", f"${max7v/1e9:.1f}B"), unsafe_allow_html=True)
+
+        # ── 일별 거래량 바 차트 ─────────────────────────────────────────────
+        plot_vdf = vol_df.tail(60).copy()
+
+        def _vol_bar_color(row: pd.Series) -> str:
+            if pd.notna(row["vol_vs_avg"]) and row["vol_vs_avg"] >= 2.0:
+                return "#ff6d00"  # 주황: 급등
+            if pd.notna(row["vol_vs_avg"]) and row["vol_vs_avg"] >= 1.5:
+                return "#ffb300"  # 노랑: 증가
+            if pd.notna(row["vol_chg_pct"]) and row["vol_chg_pct"] >= 0:
+                return "#26c77a"  # 초록: 전일 대비 상승
+            return "#ef5350"      # 빨강: 전일 대비 하락
+
+        bar_clrs = [_vol_bar_color(r) for _, r in plot_vdf.iterrows()]
+
+        vfig = go.Figure()
+        vfig.add_trace(go.Bar(
+            x=plot_vdf["date"],
+            y=plot_vdf["volume"] / 1e9,
+            marker_color=bar_clrs,
+            name="일별 거래량",
+            hovertemplate="<b>%{x|%Y-%m-%d}</b><br>거래량: $%{y:.2f}B<extra></extra>",
+        ))
+        if plot_vdf["vol_ma30"].notna().any():
+            vfig.add_trace(go.Scatter(
+                x=plot_vdf["date"],
+                y=plot_vdf["vol_ma30"] / 1e9,
+                name="30일 평균",
+                line=dict(color="#42a5f5", width=2, dash="dash"),
+                hovertemplate="30일 평균: $%{y:.2f}B<extra></extra>",
+            ))
+            vfig.add_trace(go.Scatter(
+                x=plot_vdf["date"],
+                y=plot_vdf["vol_ma30"] * 2 / 1e9,
+                name="급등 기준 (평균×2)",
+                line=dict(color="#ff6d00", width=1, dash="dot"),
+                hoverinfo="skip",
+            ))
+        vfig.update_layout(
+            title=dict(text="전세계 BTC 일별 거래량 (최근 60일)", font=dict(size=13, color="#333")),
+            height=320,
+            paper_bgcolor="#ffffff",
+            plot_bgcolor="#fafafa",
+            template="plotly_white",
+            margin=dict(t=45, b=10, l=10, r=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            yaxis=dict(title="거래량 (Billion USD)", ticksuffix="B"),
+            xaxis=dict(tickformat="%m/%d"),
+            font=dict(color="#222222", size=11),
+        )
+        st.plotly_chart(vfig, use_container_width=True, key="global_vol_bar")
+
+        # ── 전일 대비 변화율 차트 ───────────────────────────────────────────
+        chg_vdf = plot_vdf.dropna(subset=["vol_chg_pct"])
+        if not chg_vdf.empty:
+            chg_clrs = ["#26c77a" if v >= 0 else "#ef5350" for v in chg_vdf["vol_chg_pct"]]
+            cfig = go.Figure(go.Bar(
+                x=chg_vdf["date"],
+                y=chg_vdf["vol_chg_pct"],
+                marker_color=chg_clrs,
+                hovertemplate="<b>%{x|%Y-%m-%d}</b><br>전일 대비: %{y:+.1f}%<extra></extra>",
+                name="거래량 변화율",
+            ))
+            cfig.add_hline(y=0, line_color="#aaaaaa", line_width=1)
+            cfig.add_hline(y=100, line_dash="dot", line_color="#ff6d00", line_width=1,
+                           annotation_text="급등 +100%",
+                           annotation_font=dict(size=10, color="#ff6d00"))
+            cfig.add_hline(y=-50, line_dash="dot", line_color="#ef5350", line_width=1,
+                           annotation_text="급감 -50%",
+                           annotation_font=dict(size=10, color="#ef5350"))
+            cfig.update_layout(
+                title=dict(text="전일 대비 거래량 변화율 (%)", font=dict(size=13, color="#333")),
+                height=230,
+                paper_bgcolor="#ffffff",
+                plot_bgcolor="#fafafa",
+                template="plotly_white",
+                margin=dict(t=45, b=10, l=10, r=10),
+                showlegend=False,
+                yaxis=dict(ticksuffix="%"),
+                xaxis=dict(tickformat="%m/%d"),
+                font=dict(color="#222222", size=11),
+            )
+            st.plotly_chart(cfig, use_container_width=True, key="global_vol_chg")
+
+        st.caption(
+            "📌 주황 = 평균 2배 이상 급등 · 노랑 = 평균 1.5배 이상 · 초록 = 전일 대비 증가 · 빨강 = 전일 대비 감소  "
+            "| 출처: CoinGecko (전세계 거래소 합산 USD 기준) | 점선 = 30일 평균"
+        )
+    else:
+        st.warning(
+            "CoinGecko 데이터를 불러올 수 없습니다. Rate Limit(분당 10~30회) 초과 시 1분 후 새로고침 해주세요.",
             icon="⚠️",
         )
 
